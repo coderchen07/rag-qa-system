@@ -80,6 +80,8 @@ graph TD
     BE --> FE
 ```
 
+
+
 ## 5. 环境变量（以实际代码为准）
 
 请参考 `backend/.env.example`：
