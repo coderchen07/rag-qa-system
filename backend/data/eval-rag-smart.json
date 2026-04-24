@@ -1,0 +1,142 @@
+[
+  {
+    "id": "fact-001",
+    "category": "fact",
+    "question": "蓝鲸流程包含哪三个固定步骤？",
+    "expected_keywords": ["提交工单", "初审", "同步到知识库"],
+    "notes": "应命中 rag-upload-test 文档。"
+  },
+  {
+    "id": "fact-002",
+    "category": "fact",
+    "question": "北辰计划的核心目标是什么？",
+    "expected_keywords": ["命中率", "90%", "减少无关召回"],
+    "notes": "应命中 upload-utf8-validation 文档。"
+  },
+  {
+    "id": "fact-003",
+    "category": "fact",
+    "question": "缓存雪崩如何缓解？",
+    "expected_keywords": ["过期时间抖动", "缓存雪崩"],
+    "notes": "应命中 chunking-test-knowledge 第 09 章。"
+  },
+  {
+    "id": "fact-004",
+    "category": "fact",
+    "question": "为什么超过大小不能上传？",
+    "expected_keywords": ["体积限制", "内存峰值", "解析超时"],
+    "notes": "应命中 chunking-test-knowledge 第 18 章。"
+  },
+  {
+    "id": "fact-005",
+    "category": "fact",
+    "question": "token 失效后前端应如何处理？",
+    "expected_keywords": ["401", "清理登录态", "跳转登录页"],
+    "notes": "应命中 chunking-test-knowledge 第 23 章。"
+  },
+  {
+    "id": "fact-006",
+    "category": "fact",
+    "question": "管理员和普通用户在权限模型里有什么差别？",
+    "expected_keywords": ["RBAC", "敏感操作", "审计日志"],
+    "notes": "应命中 chunking-test-knowledge 第 11 章。"
+  },
+  {
+    "id": "summary-001",
+    "category": "summary",
+    "question": "请总结该项目里 RAG 上传与检索链路的核心流程。",
+    "expected_keywords": ["上传", "分块", "向量检索", "生成回答"],
+    "notes": "允许跨多个文档总结。"
+  },
+  {
+    "id": "summary-002",
+    "category": "summary",
+    "question": "请概括 chunking-test-knowledge 文档中关于可靠性与运维的要点。",
+    "expected_keywords": ["重启恢复", "日志", "错误格式", "审计"],
+    "notes": "应以章节 20/21/24/28 等内容为主。"
+  },
+  {
+    "id": "summary-003",
+    "category": "summary",
+    "question": "总结本系统在上传安全方面的策略。",
+    "expected_keywords": ["文件类型限制", "大小限制", "编码质量", "拒绝入库"],
+    "notes": "应体现 upload 限制与质量闸门。"
+  },
+  {
+    "id": "summary-004",
+    "category": "summary",
+    "question": "请概括“为什么参数调整要灰度发布”。",
+    "expected_keywords": ["小流量验证", "命中率", "失败率"],
+    "notes": "应命中 chunking-test-knowledge 第 32 章。"
+  },
+  {
+    "id": "summary-005",
+    "category": "summary",
+    "question": "请总结“发布前回归测试清单”应包含哪些模块。",
+    "expected_keywords": ["登录鉴权", "上传删除", "搜索命中", "RAG 回答", "流式聊天"],
+    "notes": "应命中 chunking-test-knowledge 第 33 章。"
+  },
+  {
+    "id": "summary-006",
+    "category": "summary",
+    "question": "请总结“向量库迁移”这一章的核心结论。",
+    "expected_keywords": ["内存向量库", "持久化向量数据库", "模型一致性"],
+    "notes": "应命中 chunking-test-knowledge 第 38 章。"
+  },
+  {
+    "id": "analysis-001",
+    "category": "analysis",
+    "question": "分析为什么检索阈值过高会导致“搜不到”，过低会导致“噪音”。",
+    "expected_keywords": ["召回不足", "噪音", "阈值调优"],
+    "notes": "应命中 chunking-test-knowledge 第 14 章。"
+  },
+  {
+    "id": "analysis-002",
+    "category": "analysis",
+    "question": "分析为什么 RAG 需要 overlap 分块。",
+    "expected_keywords": ["上下文断裂", "重叠窗口", "完整性"],
+    "notes": "应命中 chunking-test-knowledge 第 12/37 章。"
+  },
+  {
+    "id": "analysis-003",
+    "category": "analysis",
+    "question": "分析为什么要限制 FRONTEND_ORIGIN 与 CORS 白名单。",
+    "expected_keywords": ["可信域名", "跨域调用", "安全性"],
+    "notes": "应命中 chunking-test-knowledge 第 22 章。"
+  },
+  {
+    "id": "analysis-004",
+    "category": "analysis",
+    "question": "分析为什么系统要统一错误返回格式。",
+    "expected_keywords": ["接口一致性", "前端处理稳定", "code/message"],
+    "notes": "应命中 chunking-test-knowledge 第 21 章。"
+  },
+  {
+    "id": "analysis-005",
+    "category": "analysis",
+    "question": "分析本项目采用本地 embedding 的利弊。",
+    "expected_keywords": ["可用性", "网络波动", "部署成本", "模型选择"],
+    "notes": "应命中 chunking-test-knowledge 第 13 章。"
+  },
+  {
+    "id": "analysis-006",
+    "category": "analysis",
+    "question": "分析为什么“可解释性”对 RAG 系统至关重要。",
+    "expected_keywords": ["命中依据", "可信度", "片段摘要"],
+    "notes": "应命中 chunking-test-knowledge 第 35 章。"
+  },
+  {
+    "id": "cross-001",
+    "category": "fact",
+    "question": "如果问题是英文短词 rag，为什么可能要有特殊兜底？",
+    "expected_keywords": ["短英文词", "空结果", "差异化策略"],
+    "notes": "应命中 chunking-test-knowledge 第 29 章。"
+  },
+  {
+    "id": "cross-002",
+    "category": "analysis",
+    "question": "请分析一个高质量 RAG 项目的验收标准应包含哪些维度。",
+    "expected_keywords": ["功能正确", "权限生效", "异常可控", "准确性", "可追溯性"],
+    "notes": "应命中 chunking-test-knowledge 第 40 章。"
+  }
+]

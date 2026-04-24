@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   deleteUploadedDocument,
+  getUploadJob,
   listUploadedDocuments,
   uploadDocument,
 } from "@/api/upload";
@@ -9,6 +10,12 @@ type UploadModalProps = {
   open: boolean;
   onClose: () => void;
 };
+
+const DIRECT_UPLOAD_MAX_BYTES = 2 * 1024 * 1024;
+const DIRECT_UPLOAD_MAX_CHARS = 160000;
+const SPLIT_PART_MAX_CHARS = 70000;
+const SPLIT_PART_OVERLAP_CHARS = 1000;
+const SPLITTABLE_EXTENSIONS = new Set([".txt", ".md", ".csv", ".json"]);
 
 function UploadModal({ open, onClose }: UploadModalProps): JSX.Element | null {
   const [documents, setDocuments] = useState<
@@ -26,6 +33,7 @@ function UploadModal({ open, onClose }: UploadModalProps): JSX.Element | null {
   const [file, setFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [uploadDetail, setUploadDetail] = useState("");
   const [message, setMessage] = useState("");
 
   const fetchDocuments = async (): Promise<void> => {
@@ -45,6 +53,9 @@ function UploadModal({ open, onClose }: UploadModalProps): JSX.Element | null {
     if (!open) {
       return;
     }
+    setMessage("");
+    setUploadDetail("");
+    setProgress(0);
     void fetchDocuments();
   }, [open]);
 
@@ -55,9 +66,13 @@ function UploadModal({ open, onClose }: UploadModalProps): JSX.Element | null {
     }
     setIsUploading(true);
     setProgress(0);
+    setUploadDetail("");
     setMessage("");
     try {
-      const resultMessage = await uploadDocument(file, setProgress);
+      const resultMessage = await uploadWithAutoSplit(file, (percent, detail) => {
+        setProgress(percent);
+        setUploadDetail(detail);
+      });
       setMessage(resultMessage);
       setFile(null);
       if (fileInputRef.current) {
@@ -67,9 +82,150 @@ function UploadModal({ open, onClose }: UploadModalProps): JSX.Element | null {
     } catch (error: unknown) {
       const text = error instanceof Error ? error.message : "上传失败，请稍后重试。";
       setMessage(text);
-      alert(text);
+      setUploadDetail(`失败：${text}`);
     } finally {
       setIsUploading(false);
+    }
+  };
+
+  const uploadWithAutoSplit = async (
+    targetFile: File,
+    onProgress: (percent: number, detail: string) => void,
+  ): Promise<string> => {
+    const extension = getFileExtension(targetFile.name);
+    let textContent: string | null = null;
+    let shouldSplit = targetFile.size > DIRECT_UPLOAD_MAX_BYTES;
+    if (SPLITTABLE_EXTENSIONS.has(extension)) {
+      if (extension === ".txt" && !(await isUtf8TextFile(targetFile))) {
+        throw new Error(
+          "检测到该 TXT 不是 UTF-8 编码。请先转为 UTF-8 后再上传，避免分片后出现乱码检索结果。",
+        );
+      }
+      textContent = await targetFile.text();
+      shouldSplit = shouldSplit || textContent.length > DIRECT_UPLOAD_MAX_CHARS;
+    }
+
+    if (!shouldSplit) {
+      const { message: msg, jobId } = await uploadDocument(targetFile, (percent) => {
+        onProgress(percent, "单文件上传");
+      });
+      onProgress(100, "后台处理中...");
+      await waitUploadJobDone(jobId, (statusText) => onProgress(100, statusText));
+      return msg;
+    }
+
+    if (!textContent) {
+      throw new Error("当前文件类型暂不支持自动切分，请先手动拆分后上传。");
+    }
+    const parts = splitTextContent(targetFile.name, textContent);
+    if (parts.length === 0) {
+      throw new Error("文件切分失败，请检查文本内容。");
+    }
+
+    const batchId = `batch-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    for (let i = 0; i < parts.length; i += 1) {
+      const partFile = parts[i];
+      const partIndex = i + 1;
+      const { jobId } = await uploadDocument(
+        partFile,
+        (partPercent) => {
+          const base = i / parts.length;
+          const transferStage = (partPercent / 100) * (0.45 / parts.length);
+          const aggregate = Math.round((base + transferStage) * 100);
+          onProgress(aggregate, `分片传输 ${partIndex}/${parts.length}`);
+        },
+        {
+          batchId,
+          partIndex,
+          partTotal: parts.length,
+          originalFileName: targetFile.name,
+        },
+      );
+      await waitUploadJobDone(jobId, (statusText) => {
+        const processedBase = i / parts.length;
+        const processingStage = 0.55 / parts.length;
+        const aggregate = Math.round((processedBase + processingStage) * 100);
+        onProgress(aggregate, `分片处理 ${partIndex}/${parts.length} | ${statusText}`);
+      });
+      const completed = Math.round(((i + 1) / parts.length) * 100);
+      onProgress(completed, `已完成 ${i + 1}/${parts.length}`);
+    }
+    return `上传成功（自动切分 ${parts.length} 个子文件）`;
+  };
+
+  const waitUploadJobDone = async (
+    jobId: string,
+    onStatus: (statusText: string) => void,
+  ): Promise<void> => {
+    const timeoutMs = 180000;
+    const begin = Date.now();
+    while (Date.now() - begin < timeoutMs) {
+      const job = await getUploadJob(jobId);
+      if (job.status === "done") {
+        onStatus("处理完成");
+        return;
+      }
+      if (job.status === "failed") {
+        const reason = job.error?.trim() || "后台处理失败，请稍后重试。";
+        throw new Error(`上传被拒绝：${reason}`);
+      }
+      onStatus(job.status === "processing" ? "后台处理中..." : "排队中...");
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    }
+    throw new Error("后台处理超时，请稍后查看文档列表确认结果。");
+  };
+
+  const getFileExtension = (name: string): string => {
+    const dot = name.lastIndexOf(".");
+    return dot >= 0 ? name.slice(dot).toLowerCase() : "";
+  };
+
+  const splitTextContent = (fileName: string, text: string): File[] => {
+    if (!text.trim()) {
+      return [];
+    }
+    const chunks: string[] = [];
+    let start = 0;
+    while (start < text.length) {
+      const end = Math.min(text.length, start + SPLIT_PART_MAX_CHARS);
+      let piece = text.slice(start, end);
+      if (end < text.length) {
+        const lastBreak = Math.max(
+          piece.lastIndexOf("\n"),
+          piece.lastIndexOf("。"),
+          piece.lastIndexOf("！"),
+          piece.lastIndexOf("？"),
+        );
+        if (lastBreak > SPLIT_PART_MAX_CHARS * 0.5) {
+          piece = piece.slice(0, lastBreak + 1);
+        }
+      }
+      if (piece.trim().length === 0) {
+        break;
+      }
+      chunks.push(piece);
+      if (start + piece.length >= text.length) {
+        break;
+      }
+      start = Math.max(0, start + piece.length - SPLIT_PART_OVERLAP_CHARS);
+    }
+
+    const ext = getFileExtension(fileName) || ".txt";
+    const base = fileName.replace(/\.[^.]+$/, "");
+    return chunks.map((chunk, idx) => {
+      const partName = `${base}.part-${String(idx + 1).padStart(3, "0")}${ext}`;
+      return new File([chunk], partName, { type: "text/plain;charset=utf-8" });
+    });
+  };
+
+  const isUtf8TextFile = async (targetFile: File): Promise<boolean> => {
+    try {
+      const buffer = await targetFile.arrayBuffer();
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      decoder.decode(buffer);
+      return true;
+    } catch {
+      return false;
     }
   };
 
@@ -119,8 +275,30 @@ function UploadModal({ open, onClose }: UploadModalProps): JSX.Element | null {
           支持 .pdf/.docx/.txt/.csv/.json/.md，单文件最大 20MB。
         </p>
 
+        {message ? (
+          <div
+            className={`mt-3 rounded border px-3 py-2 text-sm ${
+              /失败|拒绝|错误|超时/.test(message)
+                ? "border-rose-500/40 bg-rose-950/40 text-rose-200"
+                : "border-emerald-500/30 bg-emerald-950/30 text-emerald-200"
+            }`}
+          >
+            {message}
+          </div>
+        ) : null}
+
         {isUploading ? (
-          <p className="mt-2 text-xs text-sky-300">上传进度：{progress}%</p>
+          <div className="mt-2 space-y-1">
+            <p className="text-xs text-sky-300">
+            上传进度：{progress}% {uploadDetail ? `| ${uploadDetail}` : ""}
+            </p>
+            <div className="h-2 w-full rounded bg-slate-800">
+              <div
+                className="h-2 rounded bg-sky-500 transition-all"
+                style={{ width: `${Math.max(2, progress)}%` }}
+              />
+            </div>
+          </div>
         ) : null}
 
         <button
@@ -176,7 +354,6 @@ function UploadModal({ open, onClose }: UploadModalProps): JSX.Element | null {
           )}
         </section>
 
-        {message ? <p className="mt-3 text-sm text-slate-200">{message}</p> : null}
       </div>
     </div>
   );

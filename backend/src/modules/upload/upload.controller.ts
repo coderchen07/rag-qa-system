@@ -1,8 +1,10 @@
 import {
+  Body,
   BadRequestException,
   Controller,
   Delete,
   Get,
+  NotFoundException,
   Param,
   Post,
   UploadedFile,
@@ -63,15 +65,48 @@ export class UploadController {
       },
     }),
   )
-  async uploadDocument(@UploadedFile() file?: Express.Multer.File) {
+  async uploadDocument(
+    @UploadedFile() file?: Express.Multer.File,
+    @Body()
+    body?: {
+      batchId?: string;
+      partIndex?: string;
+      partTotal?: string;
+      originalFileName?: string;
+    },
+  ) {
     if (!file) {
       throw new BadRequestException("file is required");
     }
-
-    await this.uploadService.processUpload(file);
+    const parsedPartIndex = Number(body?.partIndex ?? "");
+    const parsedPartTotal = Number(body?.partTotal ?? "");
+    const hasBatchMeta = Boolean(body?.batchId);
+    if (hasBatchMeta && (!Number.isInteger(parsedPartIndex) || !Number.isInteger(parsedPartTotal))) {
+      throw new BadRequestException("invalid batch metadata");
+    }
+    const job = this.uploadService.enqueueUpload(file, {
+      batchId: body?.batchId,
+      partIndex: Number.isInteger(parsedPartIndex) ? parsedPartIndex : undefined,
+      partTotal: Number.isInteger(parsedPartTotal) ? parsedPartTotal : undefined,
+      originalFileName: body?.originalFileName,
+    });
     return {
       code: 0,
-      message: "上传成功",
+      message: "文件已加入处理队列",
+      data: job,
+    };
+  }
+
+  @Get("jobs/:jobId")
+  @Roles("admin")
+  getUploadJob(@Param("jobId") jobId: string) {
+    const job = this.uploadService.getJob(jobId);
+    if (!job) {
+      throw new NotFoundException("job not found");
+    }
+    return {
+      code: 0,
+      data: job,
     };
   }
 

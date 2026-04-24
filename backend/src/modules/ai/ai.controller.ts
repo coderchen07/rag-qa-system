@@ -23,8 +23,14 @@ export class AiController {
       throw new BadRequestException("question is required");
     }
 
-    const answer = await this.aiService.rag(question);
-    return { code: 0, answer };
+    const smart = await this.aiService.ragSmart(question);
+    return {
+      code: 0,
+      // Backward compatibility for existing frontend.
+      answer: smart.answer,
+      // New smart payload for evidence-driven UI.
+      data: smart,
+    };
   }
 
   @Get("search")

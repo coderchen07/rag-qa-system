@@ -1,13 +1,31 @@
 import axios from "axios";
 import { http } from "./http";
 
+export type RagEvidence = {
+  title: string;
+  snippet: string;
+  chunkIndex?: number;
+};
+
+export type RagMeta = {
+  mode?: "fact" | "summary" | "analysis";
+  contextCount?: number;
+};
+
 type RagResponse = {
   code: number;
   answer: string;
+  data?: {
+    answer?: string;
+    evidence?: RagEvidence[];
+    meta?: RagMeta;
+  };
   message?: string;
 };
 
-export async function ask(question: string): Promise<string> {
+export async function ask(
+  question: string,
+): Promise<{ answer: string; evidence: RagEvidence[]; meta?: RagMeta }> {
   if (!question || question.trim().length === 0) {
     throw new Error("请输入有效问题后再试。");
   }
@@ -21,7 +39,12 @@ export async function ask(question: string): Promise<string> {
       throw new Error(response.data?.message ?? "后端返回异常状态，请稍后重试。");
     }
 
-    return response.data.answer;
+    const smartData = response.data?.data;
+    const answer =
+      (typeof smartData?.answer === "string" ? smartData.answer : response.data.answer) ?? "";
+    const evidence = Array.isArray(smartData?.evidence) ? smartData.evidence : [];
+    const meta = smartData?.meta;
+    return { answer, evidence, meta };
   } catch (error: unknown) {
     if (axios.isAxiosError(error)) {
       const message =

@@ -4,6 +4,8 @@ import { useRagStore } from "@/store/rag";
 function RAG(): JSX.Element {
   const question = useRagStore((state) => state.question);
   const answer = useRagStore((state) => state.answer);
+  const evidence = useRagStore((state) => state.evidence);
+  const meta = useRagStore((state) => state.meta);
   const isLoading = useRagStore((state) => state.isLoading);
   const setQuestion = useRagStore((state) => state.setQuestion);
   const retrieve = useRagStore((state) => state.retrieve);
@@ -65,6 +67,33 @@ function RAG(): JSX.Element {
             </p>
           )}
         </section>
+
+        {evidence.length > 0 ? (
+          <section className="mt-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-slate-300">证据片段</h3>
+              {meta?.mode ? (
+                <span className="text-xs text-slate-400">模式：{meta.mode}</span>
+              ) : null}
+            </div>
+            <ul className="mt-2 space-y-2">
+              {evidence.map((item, idx) => (
+                <li
+                  key={`${item.title}-${idx}`}
+                  className="rounded-lg border border-slate-800 bg-slate-950 p-3"
+                >
+                  <p className="text-xs text-sky-300">
+                    {item.title}
+                    {typeof item.chunkIndex === "number" ? ` · chunk #${item.chunkIndex}` : ""}
+                  </p>
+                  <p className="mt-1 whitespace-pre-wrap text-sm text-slate-200">
+                    {item.snippet}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
       </section>
     </main>
   );
