@@ -1,11 +1,21 @@
-import { Injectable } from "@nestjs/common";
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+  OnModuleInit,
+} from "@nestjs/common";
 import { ChatDeepSeek } from "@langchain/deepseek";
 import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/huggingface_transformers";
 import { Document } from "@langchain/core/documents";
-import { BaseMessageLike } from "@langchain/core/messages";
+import { AIMessage, BaseMessageLike, ToolMessage } from "@langchain/core/messages";
 import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { ConversationService } from "../conversation/conversation.service";
+import { ConversationRole } from "../conversation/entities/session.entity";
+import { ToolsService } from "../tools/tools.service";
+import { FeedbackService } from "../feedback/feedback.service";
 
 type UploadedDocChunk = {
   uploadId: string;
@@ -33,8 +43,15 @@ type RagEvidence = {
   chunkIndex?: number;
 };
 
+type RagSource = {
+  title: string;
+  score: number;
+};
+
 type RagSmartResult = {
   answer: string;
+  correctionUsed: boolean;
+  sources: RagSource[];
   evidence: RagEvidence[];
   meta: {
     mode: RagSmartMode;
@@ -42,8 +59,18 @@ type RagSmartResult = {
   };
 };
 
+type PersistedVectorIndexV1 = {
+  version: 1;
+  embeddingModelPath: string;
+  fingerprint: string;
+  documentCount: number;
+  vectors: number[][];
+};
+
 @Injectable()
-export class AiService {
+export class AiService implements OnModuleInit {
+  private readonly maxContextTokens = 4000;
+  private readonly recentMessagesToKeep = 10;
   private readonly searchTopK = 3;
   private readonly searchScoreThreshold: number;
   private readonly ragTopK = 3;
@@ -82,9 +109,20 @@ export class AiService {
     "data",
     "uploaded-documents-meta.json",
   );
+  private readonly vectorIndexFilePath = path.join(
+    __dirname,
+    "..",
+    "..",
+    "..",
+    "data",
+    "vector-index.json",
+  );
+  private readonly vectorEmbedBatchSize = 48;
   private llm!: ChatDeepSeek;
   private embeddings!: HuggingFaceTransformersEmbeddings;
-  private vectorStore!: MemoryVectorStore;
+  private vectorStore?: MemoryVectorStore;
+  private readonly vectorStoreBootPromise: Promise<void>;
+  private persistVectorIndexChain: Promise<void> = Promise.resolve();
   private postDocuments: Document[] = [];
   private uploadedDocuments: Document[] = [];
   private uploadedMetaById = new Map<string, UploadDocMeta>();
@@ -122,7 +160,11 @@ export class AiService {
     ["劃", "划"],
   ]);
 
-  constructor() {
+  constructor(
+    private readonly toolsService: ToolsService,
+    private readonly feedbackService: FeedbackService,
+    private readonly conversationService: ConversationService,
+  ) {
     this.searchScoreThreshold = Number(process.env.SEARCH_SCORE_THRESHOLD ?? "0.45");
 
     const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
@@ -141,14 +183,38 @@ export class AiService {
     });
 
     const embeddings = new HuggingFaceTransformersEmbeddings({
-      model: path.join(process.cwd(), "models", "bge-small-zh-v1.5"),
+      model: this.getEmbeddingModelPath(),
     });
     this.llm = llm;
     this.embeddings = embeddings;
 
-    void this.initializeVectorStore().catch((error: unknown) => {
-      console.error("Failed to initialize AI vector store:", error);
-    });
+    this.vectorStoreBootPromise = (async () => {
+      try {
+        await this.initializeVectorStore();
+      } catch (error: unknown) {
+        console.error("Failed to initialize AI vector store:", error);
+      }
+    })();
+  }
+
+  async onModuleInit(): Promise<void> {
+    try {
+      const definitions = this.toolsService.getDefinitions();
+      console.log(
+        "[ToolsService] definitions:",
+        JSON.stringify(definitions, null, 2),
+      );
+      const weatherMock = await this.toolsService.executeTool(
+        "get_weather",
+        { city: "深圳" },
+        { callerRole: "admin" },
+      );
+      console.log("[ToolsService] execute get_weather:", weatherMock);
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : "tools verification failed";
+      console.error("[ToolsService] verification error:", message);
+    }
   }
 
   private async initializeVectorStore(): Promise<void> {
@@ -158,7 +224,165 @@ export class AiService {
     this.uploadedMetaById = await this.loadUploadedMeta();
     this.rebuildUploadedMetaFromDocuments();
     await this.saveUploadedMeta();
-    await this.rebuildVectorStore();
+    await this.rebuildOrLoadVectorStore();
+  }
+
+  private getEmbeddingModelPath(): string {
+    return path.join(process.cwd(), "models", "bge-small-zh-v1.5");
+  }
+
+  private buildAllDocumentsForVectorEmbedding(): Document[] {
+    return [...this.getFixedDocuments(), ...this.postDocuments, ...this.uploadedDocuments];
+  }
+
+  private stableStringify(value: unknown): string {
+    if (value === null || typeof value !== "object") {
+      return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this.stableStringify(item)).join(",")}]`;
+    }
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    return `{${keys
+      .map((key) => `${JSON.stringify(key)}:${this.stableStringify(record[key])}`)
+      .join(",")}}`;
+  }
+
+  private computeVectorStoreFingerprint(documents: Document[]): string {
+    const hash = createHash("sha256");
+    for (const doc of documents) {
+      hash.update(String(doc.pageContent ?? ""));
+      hash.update("\u0000");
+      hash.update(this.stableStringify((doc.metadata as Record<string, unknown>) ?? {}));
+      hash.update("\u0001");
+    }
+    return hash.digest("hex");
+  }
+
+  private async tryLoadPersistedVectorStore(
+    allDocuments: Document[],
+  ): Promise<MemoryVectorStore | null> {
+    if (allDocuments.length === 0) {
+      return null;
+    }
+    try {
+      const raw = await readFile(this.vectorIndexFilePath, "utf-8");
+      const parsed = JSON.parse(raw) as PersistedVectorIndexV1;
+      if (parsed?.version !== 1) {
+        return null;
+      }
+      if (parsed.embeddingModelPath !== this.getEmbeddingModelPath()) {
+        console.warn("[AiService] vector-index: embedding model path mismatch, rebuilding.");
+        return null;
+      }
+      if (parsed.documentCount !== allDocuments.length) {
+        return null;
+      }
+      if (parsed.fingerprint !== this.computeVectorStoreFingerprint(allDocuments)) {
+        return null;
+      }
+      if (!Array.isArray(parsed.vectors) || parsed.vectors.length !== allDocuments.length) {
+        return null;
+      }
+      for (let i = 0; i < allDocuments.length; i += 1) {
+        const embedding = parsed.vectors[i];
+        if (!Array.isArray(embedding) || embedding.length === 0) {
+          return null;
+        }
+        if (embedding.some((v) => typeof v !== "number" || !Number.isFinite(v))) {
+          return null;
+        }
+      }
+      const dim = parsed.vectors[0].length;
+      if (!parsed.vectors.every((vec) => vec.length === dim)) {
+        return null;
+      }
+      const store = await MemoryVectorStore.fromExistingIndex(this.embeddings);
+      await store.addVectors(
+        parsed.vectors,
+        allDocuments.map(
+          (doc) =>
+            new Document({
+              pageContent: doc.pageContent,
+              metadata: { ...(doc.metadata as Record<string, unknown>) },
+            }),
+        ),
+      );
+      return store;
+    } catch {
+      return null;
+    }
+  }
+
+  private async persistVectorIndexToDisk(): Promise<void> {
+    if (!this.vectorStore) {
+      return;
+    }
+    const allDocuments = this.buildAllDocumentsForVectorEmbedding();
+    const memoryVectors = this.vectorStore.memoryVectors;
+    if (memoryVectors.length !== allDocuments.length) {
+      console.warn(
+        `[AiService] Skip vector-index save: memoryVectors=${memoryVectors.length} vs documents=${allDocuments.length}.`,
+      );
+      return;
+    }
+    for (let i = 0; i < allDocuments.length; i += 1) {
+      if (String(memoryVectors[i]?.content ?? "") !== String(allDocuments[i].pageContent ?? "")) {
+        console.warn("[AiService] Skip vector-index save: document order/content drift detected.");
+        return;
+      }
+    }
+    const payload: PersistedVectorIndexV1 = {
+      version: 1,
+      embeddingModelPath: this.getEmbeddingModelPath(),
+      fingerprint: this.computeVectorStoreFingerprint(allDocuments),
+      documentCount: allDocuments.length,
+      vectors: memoryVectors.map((row) => row.embedding),
+    };
+    await mkdir(path.dirname(this.vectorIndexFilePath), { recursive: true });
+    await writeFile(this.vectorIndexFilePath, JSON.stringify(payload), "utf-8");
+  }
+
+  private schedulePersistVectorIndex(): Promise<void> {
+    this.persistVectorIndexChain = this.persistVectorIndexChain
+      .then(() => this.persistVectorIndexToDisk())
+      .catch((error: unknown) => {
+        console.error("[AiService] Failed to persist vector index:", error);
+      });
+    return this.persistVectorIndexChain;
+  }
+
+  private async embedDocumentsInBatches(documents: Document[]): Promise<MemoryVectorStore> {
+    const store = await MemoryVectorStore.fromExistingIndex(this.embeddings);
+    if (documents.length === 0) {
+      return store;
+    }
+    for (let i = 0; i < documents.length; i += this.vectorEmbedBatchSize) {
+      const batch = documents.slice(i, i + this.vectorEmbedBatchSize);
+      await store.addDocuments(batch);
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+    }
+    return store;
+  }
+
+  private async rebuildOrLoadVectorStore(): Promise<void> {
+    const allDocuments = this.buildAllDocumentsForVectorEmbedding();
+    const loaded = await this.tryLoadPersistedVectorStore(allDocuments);
+    if (loaded) {
+      this.vectorStore = loaded;
+      console.log(
+        `[AiService] Vector store loaded from disk cache (${allDocuments.length} documents).`,
+      );
+      return;
+    }
+    this.vectorStore = await this.embedDocumentsInBatches(allDocuments);
+    console.log(
+      `[AiService] Vector store built with batched embeddings (${allDocuments.length} documents).`,
+    );
+    await this.persistVectorIndexToDisk();
   }
 
   private getFixedDocuments(): Document[] {
@@ -282,13 +506,7 @@ export class AiService {
   }
 
   private async rebuildVectorStore(): Promise<void> {
-    const allDocuments = [
-      ...this.getFixedDocuments(),
-      ...this.postDocuments,
-      ...this.uploadedDocuments,
-    ];
-    this.vectorStore = await MemoryVectorStore.fromDocuments(allDocuments, this.embeddings);
-    console.log(`[AiService] Vector store initialized with ${allDocuments.length} documents.`);
+    await this.rebuildOrLoadVectorStore();
   }
 
   private getAllDocuments(): Document[] {
@@ -304,10 +522,19 @@ export class AiService {
     return uploadId.length > 0 && this.deletedUploadIds.has(uploadId);
   }
 
-  private ensureVectorStoreReady(): void {
+  private async getReadyVectorStore(): Promise<MemoryVectorStore> {
+    await this.vectorStoreBootPromise;
+    if (!this.vectorStore) {
+      try {
+        await this.rebuildOrLoadVectorStore();
+      } catch (error: unknown) {
+        console.error("[AiService] Lazy vector store rebuild failed:", error);
+      }
+    }
     if (!this.vectorStore) {
       throw new Error("Vector store is not initialized yet. Please retry shortly.");
     }
+    return this.vectorStore;
   }
 
   async rag(question: string): Promise<string> {
@@ -316,7 +543,8 @@ export class AiService {
   }
 
   async ragSmart(question: string): Promise<RagSmartResult> {
-    this.ensureVectorStoreReady();
+    const vectorStore = await this.getReadyVectorStore();
+    const correctionHint = await this.feedbackService.findCorrection(question);
     const routeAnswer = this.tryAnswerByUploadMeta(question);
     if (routeAnswer) {
       return routeAnswer;
@@ -330,11 +558,23 @@ export class AiService {
       : this.smartTopK;
     const lexicalDocs = this.pickLexicalRagDocs(question, ragTopKForQuery);
     const queryEmbedding = await this.embeddings.embedQuery(question);
-    const vectorDocs = (
-      await this.vectorStore.similaritySearchVectorWithScore(queryEmbedding, ragTopKForQuery)
-    )
-      .map(([doc]) => doc)
-      .filter((doc) => !this.isDeletedUploadDoc(doc));
+    const vectorDocsWithScore = await vectorStore.similaritySearchVectorWithScore(
+      queryEmbedding,
+      ragTopKForQuery,
+    );
+    const feedbackStats = await this.feedbackService.getDocumentFeedbackStats();
+    const rerankedVectorDocs = vectorDocsWithScore
+      .filter(([doc]) => !this.isDeletedUploadDoc(doc))
+      .map(([doc, score]) => {
+        const { likeCount, dislikeCount } = this.getFeedbackWeightForDoc(feedbackStats, doc);
+        const adjustedScore = score + likeCount * 0.02 - dislikeCount * 0.05;
+        return { doc, score, adjustedScore };
+      })
+      .sort((a, b) => b.adjustedScore - a.adjustedScore);
+    const vectorDocs = rerankedVectorDocs.map((item) => item.doc);
+    const highestAdjustedScore =
+      rerankedVectorDocs.length > 0 ? rerankedVectorDocs[0].adjustedScore : 0;
+    const lowRelevanceWarning = highestAdjustedScore < 0.3;
 
     const contextDocs: Document[] = [];
     const seen = new Set<string>();
@@ -363,6 +603,40 @@ export class AiService {
       .map((doc) => doc.pageContent)
       .filter((chunk) => chunk.trim().length > 0)
       .join("\n\n");
+    const contextSummary = context.slice(0, 500);
+    const correctionDecision = correctionHint
+      ? await this.evaluateCorrectionRelevance(question, contextSummary, correctionHint)
+      : { relevant: false, reason: "no_correction" };
+    if (correctionHint) {
+      console.log(
+        `[RAG] Correction relevance check: relevant = ${correctionDecision.relevant}, reason = "${correctionDecision.reason}"`,
+      );
+    }
+    const acceptedCorrection = correctionHint && correctionDecision.relevant ? correctionHint : null;
+    const adjustedScoreByDocKey = new Map<string, number>();
+    rerankedVectorDocs.forEach((item) => {
+      const key = this.getSnippetKey(String(item.doc.pageContent ?? ""));
+      if (!key) {
+        return;
+      }
+      const current = adjustedScoreByDocKey.get(key);
+      if (current === undefined || item.adjustedScore > current) {
+        adjustedScoreByDocKey.set(key, item.adjustedScore);
+      }
+    });
+    const sourceSeen = new Set<string>();
+    const sources: RagSource[] = [];
+    finalContextDocs.forEach((doc) => {
+      const key = this.getSnippetKey(String(doc.pageContent ?? ""));
+      if (!key || sourceSeen.has(key)) {
+        return;
+      }
+      sourceSeen.add(key);
+      sources.push({
+        title: String(doc.metadata?.title ?? doc.metadata?.source ?? "unknown"),
+        score: Number(adjustedScoreByDocKey.get(key) ?? 0),
+      });
+    });
     const mode = this.classifyQuestionType(question);
     const evidence = finalContextDocs.slice(0, this.maxEvidenceItems).map((doc) => ({
       title: String(doc.metadata?.title ?? doc.metadata?.source ?? "unknown"),
@@ -370,8 +644,19 @@ export class AiService {
       chunkIndex:
         typeof doc.metadata?.chunkIndex === "number" ? Number(doc.metadata.chunkIndex) : undefined,
     }));
+    const evidenceWithCorrection = acceptedCorrection
+      ? [
+          {
+            title: "user-correction",
+            snippet: acceptedCorrection.slice(0, 220),
+          },
+          ...evidence,
+        ].slice(0, this.maxEvidenceItems)
+      : evidence;
 
-    const prompt = this.buildPromptByMode(mode, question, context);
+    const prompt = acceptedCorrection
+      ? this.buildPromptByCorrection(acceptedCorrection, question, context, lowRelevanceWarning)
+      : this.buildPromptByMode(mode, question, context, lowRelevanceWarning);
 
     const response = await this.llm.invoke([
       {
@@ -380,11 +665,18 @@ export class AiService {
       },
     ]);
     const rawAnswer = String(response.content).trim();
-    const validatedAnswer = this.enforceEvidenceGrounding(rawAnswer, evidence, context);
+    const groundingContext = acceptedCorrection ? `${acceptedCorrection}\n\n${context}` : context;
+    const validatedAnswer = this.enforceEvidenceGrounding(
+      rawAnswer,
+      evidenceWithCorrection,
+      groundingContext,
+    );
 
     return {
       answer: validatedAnswer,
-      evidence,
+      correctionUsed: Boolean(acceptedCorrection),
+      sources,
+      evidence: evidenceWithCorrection,
       meta: {
         mode,
         contextCount: finalContextDocs.length,
@@ -392,8 +684,50 @@ export class AiService {
     };
   }
 
+  private async evaluateCorrectionRelevance(
+    question: string,
+    contextSummary: string,
+    correction: string,
+  ): Promise<{ relevant: boolean; reason: string }> {
+    const request = this.llm.invoke([
+      {
+        role: "system",
+        content:
+          '你是一个严格的文本相关性评估器。根据用户问题和提供的知识库上下文，判断一条历史纠错建议是否与当前问答相关且有用。请仅返回 JSON：{"relevant": true/false, "reason": "简短说明"}。',
+      },
+      {
+        role: "user",
+        content: `用户问题：${question}\n知识库上下文摘要：${contextSummary}\n历史纠错建议：${correction}`,
+      },
+    ]);
+    try {
+      const response = (await Promise.race([
+        request,
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("timeout")), 5000);
+        }),
+      ])) as AIMessage | { content?: unknown };
+      const raw = String(response?.content ?? "").trim();
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      const payloadText = jsonMatch ? jsonMatch[0] : raw;
+      const parsed = JSON.parse(payloadText) as {
+        relevant?: unknown;
+        reason?: unknown;
+      };
+      return {
+        relevant: parsed.relevant === true,
+        reason: String(parsed.reason ?? "no_reason"),
+      };
+    } catch {
+      return {
+        relevant: false,
+        reason: "evaluation_failed_or_timeout",
+      };
+    }
+  }
+
   async search(keyword: string): Promise<string[]> {
-    this.ensureVectorStoreReady();
+    const vectorStore = await this.getReadyVectorStore();
     const normalizedKeyword = keyword.trim().toLowerCase();
     if (normalizedKeyword.length === 0) {
       return [];
@@ -427,7 +761,7 @@ export class AiService {
     const scoreThresholdForQuery = isChineseNameQuery
       ? Math.min(this.searchScoreThreshold, 0.32)
       : this.searchScoreThreshold;
-    const similarDocs = await this.vectorStore.similaritySearchVectorWithScore(
+    const similarDocs = await vectorStore.similaritySearchVectorWithScore(
       keywordEmbedding,
       searchTopKForQuery,
     );
@@ -549,6 +883,33 @@ export class AiService {
     return /^[\u4e00-\u9fff]{2,8}$/.test(keyword);
   }
 
+  private getSnippetKey(text: string): string {
+    return String(text ?? "").replace(/\s+/g, " ").trim().slice(0, 100);
+  }
+
+  private getFeedbackWeightForDoc(
+    stats: Map<string, { likes: number; dislikes: number }>,
+    doc: Document,
+  ): { likeCount: number; dislikeCount: number } {
+    if (stats.size === 0) {
+      return { likeCount: 0, dislikeCount: 0 };
+    }
+    const docKey = this.getSnippetKey(String(doc.pageContent ?? ""));
+    if (!docKey) {
+      return { likeCount: 0, dislikeCount: 0 };
+    }
+    const exact = stats.get(docKey);
+    if (exact) {
+      return { likeCount: exact.likes, dislikeCount: exact.dislikes };
+    }
+    for (const [key, value] of stats.entries()) {
+      if (docKey.includes(key) || key.includes(docKey)) {
+        return { likeCount: value.likes, dislikeCount: value.dislikes };
+      }
+    }
+    return { likeCount: 0, dislikeCount: 0 };
+  }
+
   private classifyQuestionType(question: string): RagSmartMode {
     const q = question.trim().toLowerCase();
     if (/总结|概括|经历|主线/.test(q)) {
@@ -573,6 +934,8 @@ export class AiService {
       const answer = `${target.title} 共约 ${target.chapterCount} 章（按上传文档章节标题解析）。`;
       return {
         answer,
+        correctionUsed: false,
+        sources: [],
         evidence: [
           {
             title: target.title,
@@ -586,6 +949,8 @@ export class AiService {
       const answer = `${target.title} 当前入库文本约 ${target.charCount} 字。`;
       return {
         answer,
+        correctionUsed: false,
+        sources: [],
         evidence: [
           {
             title: target.title,
@@ -599,6 +964,8 @@ export class AiService {
       const answer = target.globalSummary || "无法从提供的资料中得到答案。";
       return {
         answer,
+        correctionUsed: false,
+        sources: [],
         evidence: [
           {
             title: target.title,
@@ -611,7 +978,15 @@ export class AiService {
     return null;
   }
 
-  private buildPromptByMode(mode: RagSmartMode, question: string, context: string): string {
+  private buildPromptByMode(
+    mode: RagSmartMode,
+    question: string,
+    context: string,
+    lowRelevanceWarning = false,
+  ): string {
+    const warning = lowRelevanceWarning
+      ? "\n注意：知识库中未找到高度相关的文档，请谨慎回答。\n"
+      : "";
     if (mode === "summary") {
       return `
 你是一个“文档总结助手”。必须严格基于给定上下文回答，不得编造。
@@ -625,6 +1000,7 @@ ${context}
 
 【问题】
 ${question}
+${warning}
 `;
     }
     if (mode === "analysis") {
@@ -640,6 +1016,7 @@ ${context}
 
 【问题】
 ${question}
+${warning}
 `;
     }
     return `
@@ -654,6 +1031,26 @@ ${context}
 
 【问题】
 ${question}
+${warning}
+`;
+  }
+
+  private buildPromptByCorrection(
+    correction: string,
+    question: string,
+    context: string,
+    lowRelevanceWarning = false,
+  ): string {
+    const warning = lowRelevanceWarning
+      ? "\n注意：知识库中未找到高度相关的文档，请谨慎回答。\n"
+      : "";
+    return `
+你是一个智能助手。用户曾对类似问题给出过不满意反馈。
+【用户认可的参考答案】：${correction}
+【知识库上下文】：${context}
+请结合以上信息回答用户问题。优先参考“用户认可的参考答案”，如果知识库上下文与参考答案冲突，以参考答案为准。
+用户问题：${question}
+${warning}
 `;
   }
 
@@ -763,6 +1160,7 @@ ${question}
   }
 
   async addDocuments(documents: Document[]): Promise<void> {
+    await this.getReadyVectorStore();
     const sanitizedDocuments = documents.map((doc, index) => {
       const uploadId =
         typeof doc.metadata?.uploadId === "string" && doc.metadata.uploadId.trim().length > 0
@@ -793,6 +1191,7 @@ ${question}
       console.log(
         `[AiService] Incrementally appended ${sanitizedDocuments.length} documents. Total uploaded chunks: ${this.uploadedDocuments.length}.`,
       );
+      await this.schedulePersistVectorIndex();
       return;
     }
     await this.rebuildVectorStore();
@@ -931,17 +1330,432 @@ ${question}
     return `${title} 的章节结构包括：${chapterLead}。内容主线可概括为：${body || "暂无可用摘要片段"}。`;
   }
 
+  private async processToolCalls(
+    toolCalls: any[],
+    callerRole?: string,
+  ): Promise<ToolMessage[]> {
+    const results: ToolMessage[] = [];
+    for (const raw of toolCalls) {
+      const tc = raw as {
+        id?: string;
+        name?: string;
+        args?: Record<string, unknown> | string;
+      };
+      const name = String(tc.name ?? "").trim();
+      const id =
+        typeof tc.id === "string" && tc.id.length > 0
+          ? tc.id
+          : `call_${Date.now()}_${Math.round(Math.random() * 1e9)}`;
+      if (!name) {
+        results.push(
+          new ToolMessage({
+            content: JSON.stringify({ error: "empty_tool_name" }),
+            tool_call_id: id,
+            name: "unknown",
+            status: "error",
+          }),
+        );
+        continue;
+      }
+      let args: unknown = tc.args;
+      if (typeof args === "string") {
+        try {
+          args = JSON.parse(args) as unknown;
+        } catch {
+          args = {};
+        }
+      }
+      try {
+        const content = await this.toolsService.executeTool(name, args, {
+          callerRole,
+        });
+        results.push(
+          new ToolMessage({
+            content,
+            tool_call_id: id,
+            name,
+          }),
+        );
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : "tool_failed";
+        results.push(
+          new ToolMessage({
+            content: JSON.stringify({ error: message, tool: name }),
+            tool_call_id: id,
+            name,
+            status: "error",
+          }),
+        );
+      }
+    }
+    return results;
+  }
+
+  private getLatestUserMessageText(messages: BaseMessageLike[]): string {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const msg = messages[i] as { role?: unknown; content?: unknown };
+      if (String(msg.role ?? "").trim() !== "user") {
+        continue;
+      }
+      return String(msg.content ?? "").trim();
+    }
+    return "";
+  }
+
+  private hasTicketIntent(text: string): boolean {
+    if (!text) {
+      return false;
+    }
+    return /创建.*工单|工单|发飞书|发送.*飞书|飞书群|通知运维组|值班提醒|ticket/i.test(text);
+  }
+
+  private isTicketToolName(name: string): boolean {
+    return name === "create_ticket" || name === "send_notification";
+  }
+
+  private detectPriorityFromText(text: string): "普通" | "紧急" | "严重" {
+    const normalized = text.toLowerCase();
+    if (/p0|sev0|严重|critical/.test(normalized)) {
+      return "严重";
+    }
+    if (/p1|紧急|urgent/.test(normalized)) {
+      return "紧急";
+    }
+    return "普通";
+  }
+
+  private detectPriorityLabel(text: string): string {
+    const mapped = this.detectPriorityFromText(text);
+    if (mapped === "紧急") {
+      return "P1（紧急）";
+    }
+    if (mapped === "严重") {
+      return "P0（严重）";
+    }
+    return "普通";
+  }
+
+  private buildForcedTicketArgs(latestUserText: string): {
+    title: string;
+    description: string;
+    priority: "普通" | "紧急" | "严重";
+  } {
+    const compact = latestUserText.replace(/\s+/g, " ").trim();
+    const titleSource =
+      compact.match(/创建(?:一张|一个)?工单[:：]?\s*(.+)/)?.[1]?.trim() ??
+      compact.match(/通知(?:运维组)?[:：]?\s*(.+)/)?.[1]?.trim() ??
+      compact;
+    const title = titleSource.length > 0 ? titleSource.slice(0, 80) : "自动创建工单";
+    return {
+      title,
+      description: `由聊天意图守卫自动触发的工单。\n原始需求：${compact || "（空）"}`,
+      priority: this.detectPriorityFromText(compact),
+    };
+  }
+
+  private buildTicketArgsFromAssistantOutput(
+    assistantOutput: string,
+    latestUserText: string,
+  ): { title: string; description: string; priority: "普通" | "紧急" | "严重" } {
+    const text = assistantOutput.replace(/\r\n/g, "\n").trim();
+    const subjectFromTable =
+      text.match(/\|\s*\*\*工单主题\*\*\s*\|\s*(.+?)\s*\|/)?.[1]?.trim() ??
+      text.match(/\|\s*\*\*工单标题\*\*\s*\|\s*(.+?)\s*\|/)?.[1]?.trim();
+    const subjectFromHeading =
+      text.match(/(?:工单主题|工单标题)[:：]\s*(.+)/)?.[1]?.trim() ??
+      text.match(/##\s*📋\s*(.+)/)?.[1]?.trim();
+    const fallbackTitleSource =
+      subjectFromTable ||
+      subjectFromHeading ||
+      latestUserText.match(/创建(?:一张|一个)?工单[:：]?\s*(.+)/)?.[1]?.trim() ||
+      latestUserText.trim();
+    const title = (fallbackTitleSource || "自动创建工单").slice(0, 80);
+    const priority = this.detectPriorityFromText(`${latestUserText}\n${text}`);
+    const priorityLabel = this.detectPriorityLabel(`${latestUserText}\n${text}`);
+    const descriptionBody = this.normalizeTicketDescriptionBody(text, latestUserText);
+    return {
+      title,
+      description: `${descriptionBody}\n\n优先级：${priorityLabel}\n提交人：AI 助手`,
+      priority,
+    };
+  }
+
+  private normalizeTicketDescriptionBody(assistantOutput: string, latestUserText: string): string {
+    const base = assistantOutput.replace(/\r\n/g, "\n");
+    const sectionMatch = base.match(/###\s*📝\s*工单内容([\s\S]*)/);
+    const sectionCandidate = sectionMatch ? sectionMatch[1] : base;
+    const beforeFollowUp = sectionCandidate.split(/需要我做以下调整吗[？?]?/)[0] ?? sectionCandidate;
+    const noToolStatus = beforeFollowUp
+      .replace(/^🔧.*$/gm, "")
+      .replace(/^✅.*$/gm, "")
+      .replace(/^同步标记.*$/gm, "")
+      .replace(/^优先级判定.*$/gm, "");
+    const noTable = noToolStatus
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("|"))
+      .join("\n");
+    const plain = noTable
+      .replace(/^#{1,6}\s*/gm, "")
+      .replace(/\*\*/g, "")
+      .replace(/`/g, "")
+      .replace(/^---+$/gm, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    if (plain.length > 0) {
+      return plain.slice(0, 1200);
+    }
+    const fallback = latestUserText.replace(/\s+/g, " ").trim();
+    return `工单内容：${fallback || "（无）"}`;
+  }
+
+  private parseToolJson(content: string): Record<string, unknown> | null {
+    try {
+      const parsed = JSON.parse(content);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private buildTicketToolSummaryPrompt(toolMessages: ToolMessage[]): string | null {
+    for (const message of toolMessages) {
+      const name = String((message as { name?: unknown }).name ?? "").trim();
+      if (!this.isTicketToolName(name)) {
+        continue;
+      }
+      const payload = this.parseToolJson(String(message.content ?? ""));
+      if (!payload || String(payload.status ?? "").toLowerCase() !== "success") {
+        continue;
+      }
+      return [
+        "你已成功通过工具创建工单。请根据工具返回的详细信息生成完整工单摘要回复。",
+        "输出应包含：工单编号、标题、优先级、问题描述、执行要求（3-5条）。",
+        "若工具返回字段不足，不要编造编号或时间，可基于用户需求补充合理执行要求。",
+        "最后请礼貌询问用户是否需要补充负责人、时间节点或通知范围。",
+      ].join("\n");
+    }
+    return null;
+  }
+
+  private async forceCreateTicketTool(
+    latestUserText: string,
+    callerRole?: string,
+  ): Promise<{ ok: true; content: string } | { ok: false; message: string }> {
+    const forcedArgs = this.buildForcedTicketArgs(latestUserText);
+    try {
+      const content = await this.toolsService.executeTool("create_ticket", forcedArgs, {
+        callerRole,
+      });
+      const parsed = this.parseToolJson(content);
+      const status = String(parsed?.status ?? "").toLowerCase();
+      if (status === "error") {
+        return {
+          ok: false,
+          message: `已识别到“创建工单/通知”意图，但自动调用 create_ticket 失败：${String(parsed?.message ?? "unknown_error")}`,
+        };
+      }
+      return { ok: true, content };
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        message: `已识别到“创建工单/通知”意图，但自动调用 create_ticket 失败：${error instanceof Error ? error.message : "tool_failed"}`,
+      };
+    }
+  }
+
+  private async syncTicketByAssistantOutput(
+    latestUserText: string,
+    assistantOutput: string,
+    callerRole?: string,
+  ): Promise<{ ok: true; content: string } | { ok: false; message: string }> {
+    const args = this.buildTicketArgsFromAssistantOutput(assistantOutput, latestUserText);
+    try {
+      const content = await this.toolsService.executeTool("create_ticket", args, {
+        callerRole,
+      });
+      const parsed = this.parseToolJson(content);
+      const status = String(parsed?.status ?? "").toLowerCase();
+      if (status === "error") {
+        return {
+          ok: false,
+          message: `已识别到“创建工单/通知”意图，但基于最终回复同步发送 create_ticket 失败：${String(parsed?.message ?? "unknown_error")}`,
+        };
+      }
+      return { ok: true, content };
+    } catch (error: unknown) {
+      return {
+        ok: false,
+        message: `已识别到“创建工单/通知”意图，但基于最终回复同步发送 create_ticket 失败：${error instanceof Error ? error.message : "tool_failed"}`,
+      };
+    }
+  }
+
+  private estimateTokens(messages: BaseMessageLike[]): number {
+    let total = 0;
+    for (const message of messages) {
+      const role = String((message as { role?: unknown })?.role ?? "");
+      const content = String((message as { content?: unknown })?.content ?? "");
+      let cjkChars = 0;
+      let otherChars = 0;
+      for (const ch of content) {
+        if (/[\u3400-\u9fff]/.test(ch)) {
+          cjkChars += 1;
+        } else {
+          otherChars += 1;
+        }
+      }
+      total += cjkChars + Math.ceil(otherChars / 4) + Math.ceil(role.length / 4) + 2;
+    }
+    return total;
+  }
+
+  private async compressMessagesForContext(messages: BaseMessageLike[]): Promise<BaseMessageLike[]> {
+    const totalTokens = this.estimateTokens(messages);
+    if (totalTokens <= this.maxContextTokens || messages.length <= this.recentMessagesToKeep) {
+      return messages;
+    }
+
+    const splitIndex = Math.max(0, messages.length - this.recentMessagesToKeep);
+    const earlyMessages = messages.slice(0, splitIndex);
+    const recentMessages = messages.slice(splitIndex);
+    const earlySummaryInput = this.conversationService.summarizeMessages(
+      earlyMessages as Array<{ role?: unknown; content?: unknown }>,
+    );
+    if (!earlySummaryInput) {
+      return recentMessages;
+    }
+
+    const summaryResponse = await this.llm.invoke([
+      {
+        role: "system",
+        content:
+          "你是对话摘要助手。请将历史对话压缩成短摘要，保留用户目标、关键事实、已确定结论、未解决问题。不要杜撰。",
+      },
+      {
+        role: "user",
+        content: `请用不超过220字总结以下历史对话：\n${earlySummaryInput}`,
+      },
+    ]);
+    const summaryText = String(summaryResponse.content ?? "").trim();
+    const summaryMessage: BaseMessageLike = {
+      role: "system",
+      content:
+        summaryText.length > 0
+          ? `历史对话摘要：${summaryText}`
+          : "历史对话摘要：此前进行了多轮沟通，请结合近期消息继续回答。",
+    };
+    const compressedMessages: BaseMessageLike[] = [summaryMessage, ...recentMessages];
+    const compressedTokens = this.estimateTokens(compressedMessages);
+    console.log(
+      `[AiService] Context compressed: ${messages.length} -> ${compressedMessages.length} messages, ${totalTokens} -> ${compressedTokens} tokens.`,
+    );
+    return compressedMessages;
+  }
+
   async chat(
     messages: BaseMessageLike[],
     onChunk: (chunk: string) => void,
+    options?: { callerRole?: string },
   ): Promise<void> {
-    const stream = await this.llm.stream(messages);
+    const contextMessages = await this.compressMessagesForContext(messages);
+    const tools = this.toolsService.getDefinitions() as never[];
+    const first = await this.llm.invoke(contextMessages, { tools });
+
+    const toolCalls =
+      AIMessage.isInstance(first) && Array.isArray(first.tool_calls) && first.tool_calls.length > 0
+        ? first.tool_calls
+        : null;
+
+    if (toolCalls) {
+      const names = toolCalls
+        .map((tc) => String(tc.name ?? "").trim())
+        .filter((n) => n.length > 0);
+      const label = names.length > 0 ? names.join("、") : "unknown";
+      onChunk(`🔧 正在调用工具：${label}\n\n`);
+      const toolMessages = await this.processToolCalls(toolCalls, options?.callerRole);
+      const followUp: BaseMessageLike[] = [...contextMessages, first, ...toolMessages];
+      const ticketPrompt = this.buildTicketToolSummaryPrompt(toolMessages);
+      if (ticketPrompt) {
+        followUp.push({
+          role: "system",
+          content: ticketPrompt,
+        });
+      }
+      const final = await this.llm.invoke(followUp);
+      const text = String(final.content ?? "");
+      for (const char of text) {
+        onChunk(char);
+      }
+      return;
+    }
+
+    const stream = await this.llm.stream(contextMessages);
     for await (const chunk of stream) {
       const content = chunk.content;
       if (typeof content === "string" && content.length > 0) {
         onChunk(content);
       }
     }
+  }
+
+  async chatBySession(
+    sessionId: string,
+    userId: string,
+    content: string,
+    onChunk: (chunk: string) => void,
+    options?: { callerRole?: string },
+  ): Promise<void> {
+    const text = content.trim();
+    if (!text) {
+      throw new BadRequestException("message content is required");
+    }
+
+    try {
+      await this.conversationService.addMessage(
+        sessionId,
+        {
+          role: "user" satisfies ConversationRole,
+          content: text,
+          timestamp: new Date().toISOString(),
+        },
+        userId,
+      );
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === "SESSION_NOT_FOUND") {
+        throw new NotFoundException("会话不存在");
+      }
+      throw error;
+    }
+
+    const session = await this.conversationService.findById(sessionId, userId);
+    if (!session) {
+      throw new NotFoundException("会话不存在");
+    }
+
+    const history: BaseMessageLike[] = session.messages.map((item) => ({
+      role: item.role,
+      content: item.content,
+    }));
+
+    let assistantFull = "";
+    await this.chat(
+      history,
+      (chunk) => {
+        assistantFull += chunk;
+        onChunk(chunk);
+      },
+      options,
+    );
+
+    await this.conversationService.addMessage(
+      sessionId,
+      {
+        role: "assistant" satisfies ConversationRole,
+        content: assistantFull.trim(),
+        timestamp: new Date().toISOString(),
+      },
+      userId,
+    );
   }
 
   async checkDeepSeekHealth(): Promise<{ ok: boolean; model: string; sample: string }> {

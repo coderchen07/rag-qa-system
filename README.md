@@ -3,27 +3,58 @@
 **一个可落地的 RAG 问答系统**  
 支持知识库增强问答、文档语义搜索、流式聊天、JWT 认证与管理员文档管理。
 
-## 🖼️ 界面预览
+## 🖼️ 界面预览（亮点功能）
 
-### 登录页面
+> 说明：以下预览图为仓库内的 **PNG 截图**（GitHub 可直接渲染）。  
+> 其中 **RAG / 聊天 / 反馈 / 上传** 采用「**总览 1 张 + 关键区域特写 1 张**」，避免单张截图信息密度过高导致看不清。
 
-![登录页面](./assets/login.png)
+### 登录与权限模型（JWT + RBAC）
 
-### RAG 问答页面
+![登录与权限模型（截图）](./docs/screenshots/preview-login.png)
 
-![RAG 问答页面](./assets/rag.png)
+### Smart RAG：证据化回答 + 参考来源 + 纠错引用提示
 
-### 文档搜索页面
+**1) 整页总览（输入区 + 回答主区域一屏可见）**
 
-![文档搜索页面](./assets/search.png)
+![RAG 整页总览（截图）](./docs/screenshots/preview-rag-overview.png)
 
-### 普通聊天页面
+**2) 证据 + 参考来源展开特写（第二张请裁到关键模块）**
 
-![普通聊天页面](./assets/chat.png)
+![RAG 证据与参考来源特写（截图）](./docs/screenshots/preview-rag-evidence-sources.png)
 
-### 管理员上传界面
+### 多会话聊天：左侧会话列表 + 会话模式流式对话 + 工具状态提示
 
-![管理员上传界面](./assets/upload.png)
+**1) 整页总览（左侧会话列表 + 右侧对话区同屏）**
+
+![聊天整页总览（截图）](./docs/screenshots/preview-chat-overview.png)
+
+**2) 工具状态气泡特写（🔧 调用工具提示文案完整清晰）**
+
+![聊天工具状态特写（截图）](./docs/screenshots/preview-chat-tool-status.png)
+
+### 反馈闭环：点赞点踩纠错 + 管理员审核启用（enabled）
+
+**1) 列表总览（统计 + 筛选 + 表格表头一屏）**
+
+![反馈管理总览（截图）](./docs/screenshots/preview-feedback-overview.png)
+
+**2) `enabled` 列特写（复选框与行状态对比清晰）**
+
+![反馈启用列特写（截图）](./docs/screenshots/preview-feedback-enabled.png)
+
+### 知识库上传：管理员上传入口 + 队列/进度与错误提示
+
+**1) 上传弹窗总览（标题 + 选择区 + 主按钮）**
+
+![上传弹窗总览（截图）](./docs/screenshots/preview-upload-overview.png)
+
+**2) 进度 / 错误提示特写（进度条或红色错误条，文案完整）**
+
+![上传进度与错误提示特写（截图）](./docs/screenshots/preview-upload-progress.png)
+
+### 飞书群通知：工具 `create_ticket`（兼容 `send_notification`）推送 interactive 卡片
+
+![飞书群通知卡片（截图）](./docs/screenshots/preview-feishu-card.png)
 
 ## 📚 目录
 
@@ -39,6 +70,8 @@
 - [🤝 贡献指南](#-贡献指南)
 - [📄 许可证](#-许可证)
 
+> 实现细节与接口清单见：`docs/README.md`
+
 ## 📌 项目简介
 
 这是一个基于 `React + NestJS + LangChain` 的全栈 RAG 项目，核心目标是让大模型回答建立在可检索、可解释、可评测的知识库上下文之上。
@@ -52,8 +85,14 @@
 ## ✨ 核心特性
 
 - **Smart RAG 问答**：低压智能链路（问题类型路由 + 证据化回答 + 上下文限流）。
+- **检索透明化**：返回参考来源（标题 + 调整后分数），便于核对“为什么这样答”。
+- **反馈驱动优化**：纠错优先（命中历史纠错时提示）+ 检索结果按反馈加权重排。
+- **纠错审核闸门**：反馈支持 `enabled` 审核开关；RAG 侧对“已启用纠错”做相关度校验，降低误启用污染。
 - **文档语义搜索**：支持关键词与语义召回，返回相关文档标题。
-- **流式普通聊天**：SSE 实时输出模型回复。
+- **多会话聊天**：会话列表 + 新建/切换/删除；服务端持久化；`POST /ai/chat/session` 会话模式流式对话。
+- **上下文压缩**：长会话自动摘要早期消息，降低 token 压力并保持连贯（服务端侧）。
+- **工具调用与安全**：白名单工具、参数校验、调用日志；聊天中可触发工具并获得“调用中”提示。
+- **飞书群通知工具**：优先使用 `create_ticket`（兼容别名 `send_notification`）通过 Webhook 推送 interactive 卡片（支持飞书签名校验）。
 - **认证与权限**：JWT 鉴权 + 角色控制（管理员/普通用户）。
 - **知识库管理**：管理员可上传、查看、删除知识文档。
 - **上传持久化**：已上传文档持久化到磁盘，服务重启后自动恢复。
@@ -115,6 +154,8 @@ graph TD
     BE --> FE
 ```
 
+
+
 RAG 流程（简化）：
 
 ```mermaid
@@ -126,6 +167,8 @@ flowchart LR
     D --> E[Prompt 拼接并调用 DeepSeek]
     E --> F[返回答案]
 ```
+
+
 
 ## 🚀 快速开始
 
@@ -192,14 +235,16 @@ npm run dev
 以 `backend/.env.example` 为准：
 
 
-| 变量名                 | 说明                      |
-| ------------------- | ----------------------- |
-| `DEEPSEEK_API_KEY`  | DeepSeek API 密钥         |
-| `DEEPSEEK_MODEL`    | 模型名称（如 `deepseek-chat`） |
-| `DEEPSEEK_BASE_URL` | DeepSeek API 地址         |
-| `HF_ENDPOINT`       | Hugging Face 镜像地址       |
-| `PORT`              | 后端端口（默认 `3010`）         |
-| `FRONTEND_ORIGIN`   | 前端源地址（CORS）             |
+| 变量名                        | 说明                                                                                                   |
+| -------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `DEEPSEEK_API_KEY`         | DeepSeek API 密钥                                                                                      |
+| `DEEPSEEK_MODEL`           | 模型名称（如 `deepseek-chat`）                                                                              |
+| `DEEPSEEK_BASE_URL`        | DeepSeek API 地址                                                                                      |
+| `HF_ENDPOINT`              | Hugging Face 镜像地址                                                                                    |
+| `PORT`                     | 后端端口（默认 `3010`）                                                                                      |
+| `FRONTEND_ORIGIN`          | 前端源地址（CORS）                                                                                          |
+| `NOTIFICATION_WEBHOOK_URL` | 飞书/钉钉等机器人 Webhook（`create_ticket` / `send_notification`）                                             |
+| `FEISHU_SIGN_KEY`          | 飞书机器人签名校验密钥（当前 `create_ticket` / `send_notification` 实现要求与 Webhook 同时配置；以 `backend/.env.example` 为准） |
 
 
 DeepSeek API Key 获取：
@@ -231,7 +276,8 @@ DeepSeek API Key 获取：
 ### 4. 普通聊天
 
 - 访问 `/chat`
-- 以流式方式获取模型回复
+- 左侧会话列表管理多线程对话；服务端持久化会话与消息
+- 发送消息走会话模式接口（流式 SSE），模型可在需要时触发工具（例如飞书群通知）
 
 ### 5. 管理员知识库管理
 
@@ -248,12 +294,17 @@ rag-qa-system/
 ├─ backend/
 │  ├─ src/
 │  │  ├─ modules/
-│  │  │  ├─ ai/         # RAG、搜索、聊天核心逻辑
-│  │  │  ├─ auth/       # 登录、JWT、角色守卫
-│  │  │  └─ upload/     # 上传、列表、删除文档
+│  │  │  ├─ ai/            # RAG、搜索、聊天核心逻辑（含 Smart RAG / 工具编排）
+│  │  │  ├─ auth/          # 登录、JWT、角色守卫
+│  │  │  ├─ upload/        # 上传、列表、删除文档
+│  │  │  ├─ conversation/ # 多会话持久化（sessions.json）
+│  │  │  ├─ feedback/      # 反馈采集与管理（feedbacks.json）
+│  │  │  └─ tools/         # 工具注册与白名单执行（天气 / 飞书通知等）
 │  │  └─ main.ts        # 应用入口（CORS、全局异常处理）
 │  ├─ data/             # 知识库与上传持久化数据
 │  │  ├─ uploaded-documents-meta.json # 文档元数据缓存（章节/字数/摘要）
+│  │  ├─ sessions.json                 # 聊天会话持久化
+│  │  ├─ feedbacks.json                # 用户反馈持久化
 │  │  └─ eval-rag-smart.json          # Smart RAG 评测基线
 │  └─ .env.example      # 环境变量模板
 ├─ frontend/
@@ -261,10 +312,10 @@ rag-qa-system/
 │  │  ├─ pages/         # 登录、RAG、搜索、聊天页面
 │  │  ├─ api/           # API 封装
 │  │  ├─ store/         # Zustand 状态管理
-│  │  └─ components/    # Header、UploadModal、ProtectedRoute
+│  │  └─ components/    # Header、UploadModal、ProtectedRoute、SessionList
 │  └─ vite.config.ts
 ├─ docs/                # 需求文档与开发计划
-└─ assets/              # README 截图资源
+└─ docs/screenshots/  # README 预览资源（当前为 SVG 示意图，可替换为真实截图）
 ```
 
 ## 🛣️ Roadmap
@@ -279,6 +330,9 @@ rag-qa-system/
   - 证据约束与无依据降级
   - 上下文长度限流与截断日志
   - 文档元数据缓存与统计类问题直答
+- 多会话聊天与会话持久化（服务端 `sessions.json`）
+- 反馈闭环：采集、统计、审核启用、纠错相关度校验、检索加权
+- 工具编排：白名单、参数校验、调用日志、飞书群通知（Webhook + 签名）
 - 向量库替换为生产级后端（Milvus / PGVector / Weaviate）
 - 文档切分策略与重排序优化
 - 更完整的可观测性与评测面板

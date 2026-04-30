@@ -56,3 +56,5 @@ venv/
 backend/uploads/
 backend/data/uploaded-documents.json
 backend/models/
+backend/data/vector-index.json
+backend/.dev-backend.lock

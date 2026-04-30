@@ -7,6 +7,7 @@ import Login from "./pages/Login";
 import ProtectedRoute from "./components/ProtectedRoute";
 import { useAuthStore } from "./store/auth";
 import Header from "./components/Header";
+import FeedbackAdmin from "./pages/FeedbackAdmin";
 
 type ProtectedPageProps = {
   children: JSX.Element;
@@ -63,6 +64,14 @@ function App(): JSX.Element {
           element={
             <ProtectedPage>
               <Chat />
+            </ProtectedPage>
+          }
+        />
+        <Route
+          path="/admin/feedback"
+          element={
+            <ProtectedPage>
+              <FeedbackAdmin />
             </ProtectedPage>
           }
         />

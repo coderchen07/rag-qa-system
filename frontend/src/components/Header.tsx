@@ -28,6 +28,11 @@ function Header(): JSX.Element {
             <Link to="/chat" className="font-medium hover:text-sky-300">
               普通聊天
             </Link>
+            {user?.role === "admin" ? (
+              <Link to="/admin/feedback" className="font-medium hover:text-sky-300">
+                反馈管理
+              </Link>
+            ) : null}
           </div>
 
           <div className="flex items-center gap-3 text-sm">

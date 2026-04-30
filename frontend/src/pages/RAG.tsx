@@ -1,18 +1,40 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRagStore } from "@/store/rag";
+import { submitFeedback } from "@/api/feedback";
 
 function RAG(): JSX.Element {
   const question = useRagStore((state) => state.question);
   const answer = useRagStore((state) => state.answer);
   const evidence = useRagStore((state) => state.evidence);
+  const sources = useRagStore((state) => state.sources);
   const meta = useRagStore((state) => state.meta);
+  const correctionUsed = useRagStore((state) => state.correctionUsed);
   const isLoading = useRagStore((state) => state.isLoading);
   const setQuestion = useRagStore((state) => state.setQuestion);
   const retrieve = useRagStore((state) => state.retrieve);
 
+  const [feedbackGiven, setFeedbackGiven] = useState<"like" | "dislike" | null>(null);
+  const [showCorrection, setShowCorrection] = useState(false);
+  const [correctionDraft, setCorrectionDraft] = useState("");
+  const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
+  const [showSources, setShowSources] = useState(false);
+
   const isQuestionEmpty = useMemo(
     () => question.trim().length === 0,
     [question],
+  );
+
+  useEffect(() => {
+    setFeedbackGiven(null);
+    setShowCorrection(false);
+    setCorrectionDraft("");
+    setIsSubmittingFeedback(false);
+    setShowSources(false);
+  }, [question, answer]);
+
+  const visibleSources = useMemo(
+    () => sources.filter((item) => Number.isFinite(item.score) && item.score > 0.3),
+    [sources],
   );
 
   const handleAsk = async (): Promise<void> => {
@@ -58,14 +80,144 @@ function RAG(): JSX.Element {
         <section className="mt-6">
           <h2 className="text-sm font-semibold text-slate-300">回答结果</h2>
           {answer ? (
-            <article className="mt-2 whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-950 p-4 text-sm leading-7 text-slate-100">
-              {answer}
-            </article>
+            <>
+              {correctionUsed ? (
+                <div className="mt-2 inline-flex items-center rounded-full border border-sky-500/40 bg-sky-500/10 px-2 py-1 text-xs text-sky-200">
+                  ✨ 已参考历史纠错
+                </div>
+              ) : null}
+              <article className="mt-2 whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-950 p-4 text-sm leading-7 text-slate-100">
+                {answer}
+              </article>
+            </>
           ) : (
             <p className="mt-2 text-sm text-slate-500">
               暂无回答，先输入问题并点击提问。
             </p>
           )}
+
+          {answer && !isLoading ? (
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={feedbackGiven !== null || isSubmittingFeedback}
+                onClick={async () => {
+                  if (!question || !answer) return;
+                  setIsSubmittingFeedback(true);
+                  try {
+                    await submitFeedback({
+                      question,
+                      answer,
+                      context: evidence.map((e) => e.snippet),
+                      rating: "like",
+                    });
+                    setFeedbackGiven("like");
+                  } finally {
+                    setIsSubmittingFeedback(false);
+                  }
+                }}
+                className={[
+                  "rounded-lg px-2 py-1 text-xs transition",
+                  feedbackGiven === "like"
+                    ? "bg-emerald-600/80 text-white"
+                    : "bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-800/50 disabled:text-slate-400",
+                ].join(" ")}
+              >
+                👍 有帮助
+              </button>
+
+              <button
+                type="button"
+                disabled={feedbackGiven !== null || isSubmittingFeedback}
+                onClick={() => {
+                  if (feedbackGiven !== null) return;
+                  setShowCorrection(true);
+                }}
+                className={[
+                  "rounded-lg px-2 py-1 text-xs transition",
+                  feedbackGiven === "dislike"
+                    ? "bg-rose-600/80 text-white"
+                    : "bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-800/50 disabled:text-slate-400",
+                ].join(" ")}
+              >
+                👎 无帮助
+              </button>
+            </div>
+          ) : null}
+
+          {answer && showCorrection && !isLoading ? (
+            <div className="mt-2 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3">
+              <p className="mb-2 text-xs text-rose-200">填写正确回答（可选）</p>
+              <textarea
+                className="h-20 w-full resize-none rounded-lg border border-rose-500/20 bg-slate-950 p-2 text-xs text-slate-100 outline-none focus:border-rose-500/60"
+                value={correctionDraft}
+                onChange={(e) => setCorrectionDraft(e.target.value)}
+              />
+              <div className="mt-2 flex gap-2">
+                <button
+                  type="button"
+                  disabled={isSubmittingFeedback}
+                  onClick={async () => {
+                    if (!question || !answer) return;
+                    setIsSubmittingFeedback(true);
+                    try {
+                      await submitFeedback({
+                        question,
+                        answer,
+                        context: evidence.map((e) => e.snippet),
+                        rating: "dislike",
+                        correction: correctionDraft.trim() ? correctionDraft.trim() : undefined,
+                      });
+                      setFeedbackGiven("dislike");
+                      setShowCorrection(false);
+                      setCorrectionDraft("");
+                    } finally {
+                      setIsSubmittingFeedback(false);
+                    }
+                  }}
+                  className="rounded-lg bg-rose-600 px-3 py-1 text-xs font-semibold text-white hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-rose-600/60"
+                >
+                  提交纠错
+                </button>
+                <button
+                  type="button"
+                  disabled={isSubmittingFeedback}
+                  onClick={() => {
+                    setShowCorrection(false);
+                    setCorrectionDraft("");
+                  }}
+                  className="rounded-lg bg-slate-800 px-3 py-1 text-xs font-semibold text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-800/50"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {answer && visibleSources.length > 0 ? (
+            <div className="mt-3 rounded-lg border border-slate-800 bg-slate-950/70 p-3">
+              <button
+                type="button"
+                onClick={() => setShowSources((prev) => !prev)}
+                className="text-xs text-slate-300 hover:text-slate-100"
+              >
+                📚 参考来源 {showSources ? "▲" : "▼"}
+              </button>
+              {showSources ? (
+                <ul className="mt-2 space-y-1">
+                  {visibleSources.map((item, idx) => (
+                    <li
+                      key={`${item.title}-${idx}`}
+                      className="flex items-center justify-between text-xs text-slate-300"
+                    >
+                      <span className="truncate pr-3">{item.title}</span>
+                      <span className="text-slate-400">{item.score.toFixed(3)}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
         </section>
 
         {evidence.length > 0 ? (

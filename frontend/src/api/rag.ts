@@ -12,20 +12,35 @@ export type RagMeta = {
   contextCount?: number;
 };
 
+export type RagSource = {
+  title: string;
+  score: number;
+};
+
 type RagResponse = {
   code: number;
   answer: string;
+  correctionUsed?: boolean;
+  sources?: RagSource[];
   data?: {
     answer?: string;
     evidence?: RagEvidence[];
     meta?: RagMeta;
+    correctionUsed?: boolean;
+    sources?: RagSource[];
   };
   message?: string;
 };
 
 export async function ask(
   question: string,
-): Promise<{ answer: string; evidence: RagEvidence[]; meta?: RagMeta }> {
+): Promise<{
+  answer: string;
+  evidence: RagEvidence[];
+  sources: RagSource[];
+  meta?: RagMeta;
+  correctionUsed: boolean;
+}> {
   if (!question || question.trim().length === 0) {
     throw new Error("请输入有效问题后再试。");
   }
@@ -43,8 +58,16 @@ export async function ask(
     const answer =
       (typeof smartData?.answer === "string" ? smartData.answer : response.data.answer) ?? "";
     const evidence = Array.isArray(smartData?.evidence) ? smartData.evidence : [];
+    const sources = Array.isArray(smartData?.sources)
+      ? smartData.sources
+      : Array.isArray(response.data?.sources)
+        ? response.data.sources
+        : [];
     const meta = smartData?.meta;
-    return { answer, evidence, meta };
+    const correctionUsed = Boolean(
+      smartData?.correctionUsed ?? response.data?.correctionUsed ?? false,
+    );
+    return { answer, evidence, sources, meta, correctionUsed };
   } catch (error: unknown) {
     if (axios.isAxiosError(error)) {
       const message =
