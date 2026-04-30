@@ -322,7 +322,7 @@ rag-qa-system/
 - JWT 鉴权与角色权限控制
 - 管理员文档上传、列表、删除（含中文文件名兼容）
 - 上传文档持久化与重启自动恢复
-- Smart RAG 低压重构（步骤 1-8）：
+- Smart RAG 低压重构：
   - 结构化回答协议（answer + evidence + meta）
   - 问题类型路由（fact / summary / analysis）
   - 证据约束与无依据降级
